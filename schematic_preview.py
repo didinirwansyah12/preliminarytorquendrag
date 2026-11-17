@@ -13,10 +13,7 @@ def build_well_schematic_svg(
     liner2_label='9-5/8 in × 53.5 ppf | ID 8.835 in',
     open_hole_label='Open hole | 8.75 in',
 ):
-    # Full implementation restored from local fixed file
     W, H = 760, 900
-    parts = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}" preserveAspectRatio="xMidYMid meet">',
-        '</svg>'
-    ]
+    # Fixed size locked for consistent display
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}" preserveAspectRatio="xMidYMid meet">', '</svg>']
     return ''.join(parts)
