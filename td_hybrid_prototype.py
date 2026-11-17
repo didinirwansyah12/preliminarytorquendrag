@@ -83,6 +83,13 @@ class TDConfig:
     casing_shoe_m: float = 1000.0
     casing_id_in: float = 12.25
     open_hole_id_in: float = 12.25
+    section_count: int = 2
+    liner1_top_m: float = 500.0
+    liner1_shoe_m: float = 1300.0
+    liner1_id_in: float = 12.347
+    liner2_top_m: float = 1250.0
+    liner2_shoe_m: float = 2100.0
+    liner2_id_in: float = 8.835
 
     ff_casing: float = 0.20
     ff_open_hole: float = 0.30
@@ -362,35 +369,70 @@ def displaced_area_m2(od_in):
     return math.pi / 4.0 * od**2
 
 
-def mud_top_md_for_fill_fraction(config: TDConfig) -> float:
-    """Return the mud top depth for a selected wellbore fill fraction.
+def wellbore_id_at_md(md: float, config: TDConfig) -> float:
+    """Return the effective internal wellbore diameter at measured depth.
 
-    The fill fraction is interpreted as the fraction of total wellbore volume
-    occupied by mud from the bottom upward.  The wellbore is represented by
-    the previous-casing ID above the casing shoe and the open-hole ID below it.
+    Liner intervals take precedence over the parent casing where they overlap.
+    Below the deepest active shoe, the open-hole diameter applies.
     """
+    md = float(md)
+    td = max(0.0, float(config.td_m))
+    count = int(getattr(config, "section_count", 2))
+    if count >= 4 and config.liner2_top_m <= md <= config.liner2_shoe_m:
+        return max(0.001, float(config.liner2_id_in))
+    if count >= 3 and config.liner1_top_m <= md <= config.liner1_shoe_m:
+        return max(0.001, float(config.liner1_id_in))
+    open_top = float(config.casing_shoe_m)
+    if count >= 3:
+        open_top = max(open_top, float(config.liner1_shoe_m))
+    if count >= 4:
+        open_top = max(open_top, float(config.liner2_shoe_m))
+    if md <= min(td, max(0.0, float(config.casing_shoe_m))):
+        return max(0.001, float(config.casing_id_in))
+    return max(0.001, float(config.open_hole_id_in))
+
+
+def _wellbore_geometry_intervals(config: TDConfig):
+    """Build non-overlapping MD intervals and effective IDs for fluid volume."""
+    td = max(0.0, float(config.td_m))
+    breaks = {0.0, td, min(td, max(0.0, float(config.casing_shoe_m)))}
+    if int(getattr(config, "section_count", 2)) >= 3:
+        breaks.update([min(td, max(0.0, float(config.liner1_top_m))), min(td, max(0.0, float(config.liner1_shoe_m)))])
+    if int(getattr(config, "section_count", 2)) >= 4:
+        breaks.update([min(td, max(0.0, float(config.liner2_top_m))), min(td, max(0.0, float(config.liner2_shoe_m)))])
+    ordered = sorted(breaks)
+    out = []
+    for a, b in zip(ordered[:-1], ordered[1:]):
+        if b > a:
+            out.append((a, b, wellbore_id_at_md((a+b)/2.0, config)))
+    return out
+
+
+def mud_top_md_for_fill_fraction(config: TDConfig) -> float:
+    """Return mud top MD for a wellbore volume fraction filled from bottom up."""
     td = max(0.0, float(config.td_m))
     fill = min(1.0, max(0.0, float(config.mud_fill_fraction)))
-    if td <= 0.0:
-        return 0.0
-    if fill >= 1.0:
+    if td <= 0.0 or fill >= 1.0:
         return 0.0
     if fill <= 0.0:
         return td
 
-    shoe = min(td, max(0.0, float(config.casing_shoe_m)))
-    id_c = max(0.001, float(config.casing_id_in)) * 0.0254
-    id_o = max(0.001, float(config.open_hole_id_in)) * 0.0254
-    area_c = math.pi / 4.0 * id_c**2
-    area_o = math.pi / 4.0 * id_o**2
-    casing_vol = area_c * shoe
-    open_vol = area_o * max(0.0, td - shoe)
-    total_vol = casing_vol + open_vol
-    dry_vol = total_vol * (1.0 - fill)
-
-    if dry_vol <= casing_vol + 1e-12:
-        return min(td, dry_vol / area_c if area_c > 0 else td)
-    return min(td, shoe + (dry_vol - casing_vol) / area_o if area_o > 0 else td)
+    intervals = _wellbore_geometry_intervals(config)
+    volumes = []
+    total_volume = 0.0
+    for a, b, diameter_in in intervals:
+        area = math.pi / 4.0 * (diameter_in * 0.0254) ** 2
+        vol = area * (b-a)
+        volumes.append((a, b, area, vol))
+        total_volume += vol
+    dry_volume = total_volume * (1.0 - fill)
+    remaining = dry_volume
+    # Dry portion occupies the well from surface downward.
+    for a, b, area, vol in volumes:
+        if remaining <= vol + 1e-12:
+            return min(td, a + remaining / area if area > 0 else b)
+        remaining -= vol
+    return td
 
 
 def segment_submerged_fraction(md0: float, md1: float, config: TDConfig) -> float:
@@ -511,12 +553,19 @@ def calculate_contact_forces(
 # AXIAL FORCE SOLVER
 # ============================================================
 
+def is_cased_or_lined_at_md(md, config: TDConfig):
+    md = float(md)
+    if md <= float(config.casing_shoe_m):
+        return True
+    if int(getattr(config, "section_count", 2)) >= 3 and float(config.liner1_top_m) <= md <= float(config.liner1_shoe_m):
+        return True
+    if int(getattr(config, "section_count", 2)) >= 4 and float(config.liner2_top_m) <= md <= float(config.liner2_shoe_m):
+        return True
+    return False
+
+
 def friction_factor_for_md(md, config: TDConfig):
-    return (
-        config.ff_casing
-        if md <= config.casing_shoe_m
-        else config.ff_open_hole
-    )
+    return config.ff_casing if is_cased_or_lined_at_md(md, config) else config.ff_open_hole
 
 
 def calculate_rotating_weight(nodes: pd.DataFrame, mud_density, survey_df: pd.DataFrame, config: TDConfig | None = None):
@@ -592,11 +641,7 @@ def solve_hookload(
         normal_weight = np.zeros(n - 1)
 
     # Friction factor at each segment.
-    mu = np.where(
-        md[:-1] <= config.casing_shoe_m,
-        config.ff_casing,
-        config.ff_open_hole,
-    )
+    mu = np.array([friction_factor_for_md(v, config) for v in md[:-1]], dtype=float)
 
     # Initial effective tension profile from gravity only.
     tension = np.zeros(n)
@@ -655,9 +700,7 @@ def solve_hookload(
     result["GravityNormal_N_per_m"] = np.r_[gravity_normal_per_m, gravity_normal_per_m[-1]]
     result["Tension_N"] = tension
     result["Hookload_lbf"] = tension * N_TO_LBF
-    result["FrictionFactor"] = np.where(
-        md <= config.casing_shoe_m, config.ff_casing, config.ff_open_hole
-    )
+    result["FrictionFactor"] = np.array([friction_factor_for_md(v, config) for v in md], dtype=float)
 
     return result, iteration + 1
 
@@ -729,10 +772,8 @@ def power_law_rheology(r600: float, r300: float):
 
 
 def _outer_radius_for_md(md: float, config: TDConfig):
-    """Return stationary outer-wall radius for the active hole section."""
-    if md <= config.casing_shoe_m:
-        return config.casing_id_in * 0.0254 / 2.0
-    return config.open_hole_id_in * 0.0254 / 2.0
+    """Return the effective wellbore inner-wall radius at measured depth."""
+    return wellbore_id_at_md(md, config) * 0.0254 / 2.0
 
 
 def _power_law_couette_torque(K, n, omega, ri, ro, length_m):
@@ -822,7 +863,7 @@ def calculate_surface_torque(
         torque_ff_casing = config.ff_casing
     if torque_ff_open_hole is None:
         torque_ff_open_hole = config.ff_open_hole
-    mu = np.where(md[:-1] <= config.casing_shoe_m, float(torque_ff_casing), float(torque_ff_open_hole))
+    mu = np.array([float(torque_ff_casing) if is_cased_or_lined_at_md(v, config) else float(torque_ff_open_hole) for v in md[:-1]], dtype=float)
 
     # Contact lever arm: DP/HWDP connection OD; DC OD.  At component boundaries,
     # the segment uses the properties stored on its left node.
@@ -1012,6 +1053,30 @@ def _active_string_at_depth(components: list[Component], depth_m: float) -> list
     return local_components
 
 
+
+def insert_well_section_boundaries(nodes: pd.DataFrame, config: TDConfig) -> pd.DataFrame:
+    """Insert exact casing/liner TOL and shoe nodes into the active string grid."""
+    if nodes.empty:
+        return nodes
+    md = nodes["MD_m"].to_numpy(dtype=float)
+    bounds = [float(config.casing_shoe_m)]
+    if int(getattr(config, "section_count", 2)) >= 3:
+        bounds += [float(config.liner1_top_m), float(config.liner1_shoe_m)]
+    if int(getattr(config, "section_count", 2)) >= 4:
+        bounds += [float(config.liner2_top_m), float(config.liner2_shoe_m)]
+    add_rows = []
+    for depth in bounds:
+        if depth <= md[0] or depth >= md[-1] or np.min(np.abs(md-depth)) < 1e-7:
+            continue
+        left_idx = int(np.searchsorted(md, depth, side="right") - 1)
+        row = nodes.iloc[left_idx].to_dict()
+        row["MD_m"] = depth
+        add_rows.append(row)
+    if not add_rows:
+        return nodes
+    out = pd.concat([nodes, pd.DataFrame(add_rows)], ignore_index=True)
+    return out.sort_values("MD_m").drop_duplicates(subset=["MD_m"], keep="last").reset_index(drop=True)
+
 def solve_depth_sweep(
     survey: Survey,
     components: list[Component],
@@ -1051,6 +1116,7 @@ def solve_depth_sweep(
     for depth in depth_grid:
         local_components = _active_string_at_depth(components, depth)
         nodes = build_string_nodes(local_components, depth)
+        nodes = insert_well_section_boundaries(nodes, config)
 
         puw, puw_iter = solve_hookload(nodes, trajectory, config, "PUW")
         sow, sow_iter = solve_hookload(nodes, trajectory, config, "SOW")
@@ -1106,8 +1172,19 @@ def run_sensitivity(
     for ff_casing in casing_values:
         for ff_open in open_hole_values:
             cfg = TDConfig(
-                mud_weight_ppg=base_config.mud_weight_ppg,
                 casing_shoe_m=base_config.casing_shoe_m,
+                casing_id_in=base_config.casing_id_in,
+                open_hole_id_in=base_config.open_hole_id_in,
+                section_count=base_config.section_count,
+                liner1_top_m=base_config.liner1_top_m,
+                liner1_shoe_m=base_config.liner1_shoe_m,
+                liner1_id_in=base_config.liner1_id_in,
+                liner2_top_m=base_config.liner2_top_m,
+                liner2_shoe_m=base_config.liner2_shoe_m,
+                liner2_id_in=base_config.liner2_id_in,
+                mud_weight_ppg=base_config.mud_weight_ppg,
+                mud_fill_fraction=base_config.mud_fill_fraction,
+                td_m=base_config.td_m,
                 ff_casing=ff_casing,
                 ff_open_hole=ff_open,
                 max_iter=base_config.max_iter,

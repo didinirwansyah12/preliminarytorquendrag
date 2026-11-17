@@ -3,6 +3,8 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import streamlit.components.v1 as st_components
+from schematic_preview import build_well_schematic_svg
 
 from td_hybrid_prototype import Survey, Component, TDConfig, minimum_curvature, solve_depth_sweep, mud_top_md_for_fill_fraction
 from report import generate_tnd_report
@@ -24,6 +26,8 @@ st.set_page_config(
 # Common API 5CT casing sizes. Display includes OD, nominal weight and calculated/standard ID.
 # The selected item is used to populate the casing ID automatically.
 CASING_DATABASE = {
+    # Requested priority sizes appear first: 30, 20, 13-3/8, 10-3/4, 8-5/8, 7 in.
+    '30.000 × 202.50 lb/ft | ID 29.000 in': dict(od=30.000, wt=202.50, id=29.000),
     '20.000 × 94.00 lb/ft | ID 18.730 in': dict(od=20.000, wt=94.00, id=18.730),
     '20.000 × 106.00 lb/ft | ID 18.560 in': dict(od=20.000, wt=106.00, id=18.560),
     '20.000 × 133.00 lb/ft | ID 18.376 in': dict(od=20.000, wt=133.00, id=18.376),
@@ -33,6 +37,12 @@ CASING_DATABASE = {
     '13.375 × 68.00 lb/ft | ID 12.259 in': dict(od=13.375, wt=68.00, id=12.259),
     '13.375 × 72.00 lb/ft | ID 12.191 in': dict(od=13.375, wt=72.00, id=12.191),
     '13.375 × 86.00 lb/ft | ID 12.000 in': dict(od=13.375, wt=86.00, id=12.000),
+    '10.750 × 40.50 lb/ft | ID 9.950 in': dict(od=10.750, wt=40.50, id=9.950),
+    '10.750 × 45.50 lb/ft | ID 9.850 in': dict(od=10.750, wt=45.50, id=9.850),
+    '10.750 × 51.00 lb/ft | ID 9.750 in': dict(od=10.750, wt=51.00, id=9.750),
+    '8.625 × 24.00 lb/ft | ID 7.921 in': dict(od=8.625, wt=24.00, id=7.921),
+    '8.625 × 28.00 lb/ft | ID 7.825 in': dict(od=8.625, wt=28.00, id=7.825),
+    '8.625 × 32.00 lb/ft | ID 7.725 in': dict(od=8.625, wt=32.00, id=7.725),
     '11.750 × 38.00 lb/ft | ID 11.000 in': dict(od=11.750, wt=38.00, id=11.000),
     '11.750 × 47.00 lb/ft | ID 10.880 in': dict(od=11.750, wt=47.00, id=10.880),
     '9.625 × 36.00 lb/ft | ID 8.921 in': dict(od=9.625, wt=36.00, id=8.921),
@@ -55,6 +65,16 @@ CASING_DATABASE = {
     '4.500 × 11.60 lb/ft | ID 3.920 in': dict(od=4.500, wt=11.60, id=3.920),
     '4.500 × 13.50 lb/ft | ID 3.826 in': dict(od=4.500, wt=13.50, id=3.826),
 }
+
+# Keep the requested common sizes at the top in this exact order. All other sizes follow
+# after 7 in, even when their OD is larger than 7 in (e.g. 9-5/8 in).
+_CASING_PRIORITY = [30.000, 20.000, 13.375, 10.750, 8.625, 7.000]
+CASING_DATABASE = dict(sorted(
+    CASING_DATABASE.items(),
+    key=lambda item: (
+        0, _CASING_PRIORITY.index(item[1]['od']), list(CASING_DATABASE).index(item[0])
+    ) if item[1]['od'] in _CASING_PRIORITY else (1, 0, list(CASING_DATABASE).index(item[0]))
+))
 
 DP_DATABASE = {
     '5.000 × 4.276 × 19.50 lb/ft': dict(od=5.000, id=4.276, wt=19.50, tj=6.625, joint=9.144, conn=0.433),
@@ -89,10 +109,15 @@ DC_DATABASE = {
 
 def _init_state():
     defaults = {
-        'td': 1300.0, 'kop': 580.0, 'eob': 768.0, 'final_inc': 24.21,
-        'casing_shoe': 550.0,
-        'casing_spec': '20.000 × 94.00 lb/ft | ID 18.730 in',
-        'open_hole_id': 17.5,
+        'td': 1500.0, 'kop': 300.0, 'eob': 700.0, 'final_inc': 30.0,
+        'casing_shoe': 400.0,
+        'section_count': 4,
+        'liner1_overlap': 50.0, 'liner1_shoe': 700.0,
+        'liner1_spec': '10.750 × 40.50 lb/ft | ID 9.950 in',
+        'liner2_overlap': 50.0, 'liner2_shoe': 1300.0,
+        'liner2_spec': '8.625 × 24.00 lb/ft | ID 7.921 in',
+        'casing_spec': '13.375 × 72.00 lb/ft | ID 12.191 in',
+        'open_hole_id': 7.875,
         'mud_weight': 8.8, 'r600': 50.0, 'r300': 40.0, 'mud_fill_percent': 100.0,
         'ff_casing_min': 0.30, 'ff_casing_max': 0.50,
         'ff_open_min': 0.30, 'ff_open_max': 0.70,
@@ -102,8 +127,8 @@ def _init_state():
         'casing_string_length': 1300.0,
         'dp_std': '5.000 × 4.276 × 19.50 lb/ft',
         'hwdp_std': '5.000 × 3.000 × 49.30 lb/ft',
-        'dc_std': '8.000 × 2.750 × 147.00 lb/ft',
-        'rpm': 100.0, 'wob': 38000.0, 'bit_torque_lbf_ft': 2000.0,
+        'dc_std': '6.500 × 2.813 × 91.76 lb/ft',
+        'rpm': 60.0, 'wob': 38000.0, 'bit_torque_lbf_ft': 2000.0,
         'drilling_mode': 'On Bottom', 'max_iter': 200,
     }
     for key, value in defaults.items():
@@ -181,6 +206,9 @@ def run_case(survey, components, base, ff_casing, ff_open, bit_torque):
         casing_shoe_m=float(base.casing_shoe_m),
         casing_id_in=float(base.casing_id_in),
         open_hole_id_in=float(base.open_hole_id_in),
+        section_count=int(base.section_count),
+        liner1_top_m=float(base.liner1_top_m), liner1_shoe_m=float(base.liner1_shoe_m), liner1_id_in=float(base.liner1_id_in),
+        liner2_top_m=float(base.liner2_top_m), liner2_shoe_m=float(base.liner2_shoe_m), liner2_id_in=float(base.liner2_id_in),
         ff_casing=float(ff_casing),
         ff_open_hole=float(ff_open),
         r600=float(base.r600), r300=float(base.r300), rpm=float(base.rpm),
@@ -203,7 +231,29 @@ def build_sensitivity(survey, components, base, ff_casing_min, ff_casing_max, ff
     return dfs
 
 
-def plot_hookload(result, sensitivity, td, plot_top):
+def _annotate_depth_markers(ax, ri):
+    markers = [('KOP', ri.get('kop')) , ('EOB', ri.get('eob')), ('Casing Shoe', ri.get('casing_shoe'))]
+    if int(ri.get('section_count', 2)) >= 3:
+        markers.append(('Liner 1 Shoe', ri.get('liner1_shoe')))
+    if int(ri.get('section_count', 2)) >= 4:
+        markers.append(('Liner 2 Shoe', ri.get('liner2_shoe')))
+    seen = set()
+    for label, depth in markers:
+        if depth is None:
+            continue
+        depth = float(depth)
+        if depth in seen or depth < 0 or depth > float(ri.get('td', depth)):
+            continue
+        seen.add(depth)
+        ax.axhline(depth, color='#777777', linewidth=0.7, linestyle=(0, (3, 3)), alpha=0.65, zorder=0)
+        ax.plot([0.0], [depth], marker='o', markersize=3.2, color='#555555',
+                transform=ax.get_yaxis_transform(), clip_on=False, zorder=6)
+        ax.annotate(f'{label} @{depth:,.0f} mMD', xy=(0.012, depth), xycoords=('axes fraction', 'data'),
+                    xytext=(2, 2), textcoords='offset points', ha='left', va='bottom', fontsize=8,
+                    color='#333333', bbox=dict(boxstyle='round,pad=0.15', fc='white', ec='none', alpha=0.85),
+                    clip_on=True, zorder=7)
+
+def plot_hookload(result, sensitivity, td, plot_top, ri=None):
     fig, ax = plt.subplots(figsize=(10, 7))
     md = result['MD_m'].to_numpy()
     puw_stack = np.stack([df['PUW_lbf'].to_numpy() for df in sensitivity.values()])
@@ -214,6 +264,8 @@ def plot_hookload(result, sensitivity, td, plot_top):
     ax.plot(result['ROTW_lbf'], md, linewidth=2.2, label='ROTW — nominal')
     ax.plot(result['SOW_lbf'], md, linewidth=2.2, label='SOW — nominal')
     ax.set_ylim(float(td), float(plot_top))
+    if ri is not None:
+        _annotate_depth_markers(ax, ri)
     ax.set_xlabel('Hookload (lbf)')
     ax.set_ylabel('Measured Depth (m)')
     ax.grid(True, alpha=0.3)
@@ -222,7 +274,7 @@ def plot_hookload(result, sensitivity, td, plot_top):
     return fig
 
 
-def plot_torque(result, sensitivity, td, plot_top):
+def plot_torque(result, sensitivity, td, plot_top, ri=None):
     fig, ax = plt.subplots(figsize=(10, 7))
     sens_stack = np.stack([df['SurfaceTorque_lbf_ft'].to_numpy() for df in sensitivity.values()])
     sens_min = sens_stack.min(axis=0)
@@ -231,6 +283,8 @@ def plot_torque(result, sensitivity, td, plot_top):
     ax.fill_betweenx(md, sens_min, sens_max, alpha=0.16, label='Friction sensitivity envelope')
     ax.plot(result['SurfaceTorque_lbf_ft'], md, linewidth=2.5, label='Surface Torque — nominal')
     ax.set_ylim(float(td), float(plot_top))
+    if ri is not None:
+        _annotate_depth_markers(ax, ri)
     ax.set_xlabel('Surface Torque (lbf-ft)')
     ax.set_ylabel('Measured Depth (m)')
     ax.grid(True, alpha=0.3)
@@ -266,18 +320,102 @@ st.divider()
 
 st.header('Input Data')
 
-with st.expander('1. Well Geometry', expanded=True):
-    c1, c2, c3, c4 = st.columns(4)
-    td = c1.number_input('TD (m)', min_value=100.0, step=50.0, key='td')
-    kop = c2.number_input('KOP (m)', min_value=0.0, step=25.0, key='kop')
-    eob = c3.number_input('EOB (m)', min_value=0.0, step=25.0, key='eob')
-    final_inc = c4.number_input('Final Inclination (°)', min_value=0.0, max_value=90.0, step=0.5, key='final_inc')
-    c5, c6, c7 = st.columns([1, 1, 1])
-    casing_shoe = c5.number_input('Previous Casing Shoe (mMD)', min_value=0.0, max_value=float(td), step=25.0, key='casing_shoe')
-    casing_spec = c6.selectbox('Previous Casing — API OD × Weight | ID', list(CASING_DATABASE), key='casing_spec')
-    casing_id = CASING_DATABASE[casing_spec]['id']
-    open_hole_id = c7.number_input('Open Hole ID (in)', min_value=0.1, step=0.125, format='%.3f', key='open_hole_id')
-    st.caption(f"Previous casing: OD {CASING_DATABASE[casing_spec]['od']:.3f} in | {CASING_DATABASE[casing_spec]['wt']:.2f} lb/ft | ID {casing_id:.3f} in")
+def _on_section_count_change():
+    # Apply the requested default open-hole size when switching between the
+    # 3-section and 4-section configurations. Two-section mode preserves the
+    # user's current selection.
+    if int(st.session_state.get('section_count', 4)) == 3:
+        st.session_state['open_hole_id'] = 9.875
+    elif int(st.session_state.get('section_count', 4)) == 4:
+        st.session_state['open_hole_id'] = 7.875
+
+
+OPEN_HOLE_DIAMETERS = [26.0, 17.5, 12.25, 9.875, 7.875, 8.5, 6.5]
+
+with st.expander('1. Well Geometry & Schematic', expanded=True):
+    geometry_col, schematic_col = st.columns([1.08, 1], gap='large')
+
+    # Geometry inputs are arranged in the requested sequence, with each
+    # section's inputs on a single row. The schematic remains alongside them.
+    with geometry_col:
+        st.markdown('**Trajectory**')
+        t1, t2, t3, t4 = st.columns(4)
+        td = t1.number_input('TD (m)', min_value=100.0, step=50.0, key='td')
+        kop = t2.number_input('KOP (m)', min_value=0.0, max_value=float(td), step=25.0, key='kop')
+        eob = t3.number_input('EOB (m)', min_value=float(kop), max_value=float(td), step=25.0, key='eob')
+        final_inc = t4.number_input('Final Inclination (°)', min_value=0.0, max_value=90.0, step=0.5, key='final_inc')
+
+        st.markdown('**Number of Well Sections**')
+        section_count = st.selectbox(
+            'Configuration', [2, 3, 4],
+            format_func=lambda x: {
+                2: '2 Sections — Cased + Open Hole',
+                3: '3 Sections — Cased + 1 Liner + Open Hole',
+                4: '4 Sections — Cased + 2 Liners + Open Hole',
+            }[x], key='section_count', on_change=_on_section_count_change,
+        )
+
+        st.markdown('**Casing Section Data**')
+        c1, c2 = st.columns([1.65, 1])
+        casing_spec = c1.selectbox('Casing — API OD × Weight | ID', list(CASING_DATABASE), key='casing_spec')
+        casing_shoe = c2.number_input('Casing Shoe Depth (mMD)', min_value=0.0, max_value=float(td), step=25.0, key='casing_shoe')
+        casing_id = CASING_DATABASE[casing_spec]['id']
+        st.caption(f"OD {CASING_DATABASE[casing_spec]['od']:.3f} in | {CASING_DATABASE[casing_spec]['wt']:.2f} lb/ft | ID {casing_id:.3f} in")
+
+        liner1_overlap = float(st.session_state.liner1_overlap)
+        liner1_top = max(0.0, float(casing_shoe) - liner1_overlap)
+        liner1_shoe = float(st.session_state.liner1_shoe)
+        liner1_spec = st.session_state.liner1_spec
+        liner1_id = CASING_DATABASE[liner1_spec]['id']
+        if section_count >= 3:
+            st.markdown('**Liner 1 Data**')
+            l1a, l1b, l1c = st.columns([1.7, 0.85, 1])
+            liner1_spec = l1a.selectbox('Liner 1 — API OD × Weight | ID', list(CASING_DATABASE), key='liner1_spec')
+            liner1_overlap = l1b.number_input('Overlap (m)', min_value=0.0, max_value=60.0, step=5.0, key='liner1_overlap', help='Overlap into the previous casing/liner, limited to 0–60 m. TOL is calculated from the previous shoe depth.')
+            liner1_top = max(0.0, float(casing_shoe) - float(liner1_overlap))
+            liner1_shoe = l1c.number_input('Liner 1 Shoe (mMD)', min_value=0.0, max_value=float(td), step=25.0, key='liner1_shoe')
+            liner1_id = CASING_DATABASE[liner1_spec]['id']
+            st.caption(f"OD {CASING_DATABASE[liner1_spec]['od']:.3f} in | {CASING_DATABASE[liner1_spec]['wt']:.2f} lb/ft | ID {liner1_id:.3f} in | Calculated TOL: {liner1_top:,.0f} mMD")
+
+        liner2_overlap = float(st.session_state.liner2_overlap)
+        liner2_top = max(0.0, float(liner1_shoe) - liner2_overlap)
+        liner2_shoe = float(st.session_state.liner2_shoe)
+        liner2_spec = st.session_state.liner2_spec
+        liner2_id = CASING_DATABASE[liner2_spec]['id']
+        if section_count >= 4:
+            st.markdown('**Liner 2 Data**')
+            l2a, l2b, l2c = st.columns([1.7, 0.85, 1])
+            liner2_spec = l2a.selectbox('Liner 2 — API OD × Weight | ID', list(CASING_DATABASE), key='liner2_spec')
+            liner2_overlap = l2b.number_input('Overlap (m)', min_value=0.0, max_value=60.0, step=5.0, key='liner2_overlap', help='Overlap into the previous liner, limited to 0–60 m. TOL is calculated from the previous shoe depth.')
+            liner2_top = max(0.0, float(liner1_shoe) - float(liner2_overlap))
+            liner2_shoe = l2c.number_input('Liner 2 Shoe (mMD)', min_value=0.0, max_value=float(td), step=25.0, key='liner2_shoe')
+            liner2_id = CASING_DATABASE[liner2_spec]['id']
+            st.caption(f"OD {CASING_DATABASE[liner2_spec]['od']:.3f} in | {CASING_DATABASE[liner2_spec]['wt']:.2f} lb/ft | ID {liner2_id:.3f} in | Calculated TOL: {liner2_top:,.0f} mMD")
+
+        st.markdown('**Open Hole Data**')
+        open_hole_id = st.selectbox(
+            'Open Hole Diameter (in)', OPEN_HOLE_DIAMETERS,
+            format_func=lambda x: f'{x:g} in', key='open_hole_id',
+        )
+
+    with schematic_col:
+        st.markdown('**Interactive Well Schematic**')
+        schematic_svg = build_well_schematic_svg(
+            td=td, section_count=section_count, casing_shoe=casing_shoe,
+            liner1_top=liner1_top, liner1_shoe=liner1_shoe,
+            liner2_top=liner2_top, liner2_shoe=liner2_shoe,
+            kop=kop, eob=eob, final_inc=final_inc,
+            operation=st.session_state.get('analysis_string', 'Drilling'),
+            dp_length=max(0.0, float(td)-float(st.session_state.get('hwdp_length',214.0))-float(st.session_state.get('dc_length',113.0))),
+            hwdp_length=float(st.session_state.get('hwdp_length',214.0)), dc_length=float(st.session_state.get('dc_length',113.0)),
+            running_tubular_length=float(st.session_state.get('casing_string_length',800.0)),
+            casing_label=f"{CASING_DATABASE[casing_spec]['od']:g} in × {CASING_DATABASE[casing_spec]['wt']:g} ppf | ID {casing_id:.3f} in",
+            liner1_label=f"{CASING_DATABASE[liner1_spec]['od']:g} in × {CASING_DATABASE[liner1_spec]['wt']:g} ppf | ID {liner1_id:.3f} in",
+            liner2_label=f"{CASING_DATABASE[liner2_spec]['od']:g} in × {CASING_DATABASE[liner2_spec]['wt']:g} ppf | ID {liner2_id:.3f} in",
+            open_hole_label=f"Open hole | {open_hole_id:.3f} in",
+        )
+        st_components.html(schematic_svg, height=740, scrolling=False)
+        st.caption('Depths and string composition update from the inputs. Hover over schematic labels for section information.')
 
 with st.expander('2. Drillstring / Running String', expanded=True):
     analysis_string = st.selectbox(
@@ -311,9 +449,22 @@ with st.expander('2. Drillstring / Running String', expanded=True):
         r4.number_input('HWDP Length (m) — Auto 0', min_value=0.0, max_value=0.0, value=0.0, step=10.0, disabled=True, key='hwdp_length_auto_zero')
         hwdp_length = 0.0
 
-    # DC
+    # DC: show only body ODs that fit inside the selected open hole while drilling.
+    # This prevents the default 8-in DC from being selected with a 7-7/8-in open hole.
     r5, r6 = st.columns([2.6, 1.0])
-    dc_std = r5.selectbox('Drill Collar — OD × ID × Weight', list(DC_DATABASE), key='dc_std', disabled=analysis_string != 'Drilling')
+    if analysis_string == 'Drilling':
+        compatible_dc_options = [name for name, spec in DC_DATABASE.items() if spec['od'] < float(open_hole_id)]
+        if not compatible_dc_options:
+            st.error(f'No Drill Collar option has an OD smaller than the selected open-hole diameter ({float(open_hole_id):g} in). Choose a larger open-hole diameter or add a smaller DC to the catalogue.')
+            st.stop()
+        if st.session_state.get('dc_std') not in compatible_dc_options:
+            # Pick the largest compatible DC OD as a sensible default.
+            compatible_dc_options.sort(key=lambda name: DC_DATABASE[name]['od'], reverse=True)
+            st.session_state['dc_std'] = compatible_dc_options[0]
+        dc_options = compatible_dc_options
+    else:
+        dc_options = list(DC_DATABASE)
+    dc_std = r5.selectbox('Drill Collar — OD × ID × Weight', dc_options, key='dc_std', disabled=analysis_string != 'Drilling')
     if analysis_string == 'Drilling':
         dc_length = r6.number_input('DC Length (m)', min_value=0.0, step=10.0, key='dc_length')
     else:
@@ -364,6 +515,11 @@ with st.expander('3. Mud Rheology', expanded=True):
         td_m=float(st.session_state.td), casing_shoe_m=float(st.session_state.casing_shoe),
         casing_id_in=float(CASING_DATABASE[st.session_state.casing_spec]['id']),
         open_hole_id_in=float(st.session_state.open_hole_id),
+        section_count=int(st.session_state.section_count),
+        liner1_top_m=max(0.0, float(st.session_state.casing_shoe) - float(st.session_state.liner1_overlap)), liner1_shoe_m=float(st.session_state.liner1_shoe),
+        liner1_id_in=float(CASING_DATABASE[st.session_state.liner1_spec]['id']),
+        liner2_top_m=max(0.0, float(st.session_state.liner1_shoe) - float(st.session_state.liner2_overlap)), liner2_shoe_m=float(st.session_state.liner2_shoe),
+        liner2_id_in=float(CASING_DATABASE[st.session_state.liner2_spec]['id']),
     )
     _mud_top = mud_top_md_for_fill_fraction(_mud_preview_cfg)
     st.caption(
@@ -417,6 +573,12 @@ if run:
     if analysis_string == 'Running Liner' and (float(casing_string_length) <= 0 or float(casing_string_length) > float(td)):
         st.error('Liner length must be greater than zero and cannot exceed TD.')
         st.stop()
+    if section_count >= 3 and not (0 <= liner1_top <= casing_shoe < liner1_shoe <= td):
+        st.error('Liner 1 geometry invalid. Check overlap (0–60 m), calculated TOL, and shoe depth relative to previous casing shoe.')
+        st.stop()
+    if section_count >= 4 and not (0 <= liner2_top <= liner1_shoe < liner2_shoe <= td):
+        st.error('Liner 2 geometry invalid. Check overlap (0–60 m), calculated TOL, and shoe depth relative to Liner 1 shoe.')
+        st.stop()
 
     survey = create_j_type_survey(td, kop, final_inc, eob)
     components = create_components(
@@ -434,44 +596,53 @@ if run:
         mud_weight_ppg=mud_weight, mud_fill_fraction=float(mud_fill_percent) / 100.0, td_m=float(td),
         casing_shoe_m=casing_shoe,
         casing_id_in=casing_id, open_hole_id_in=open_hole_id,
+        section_count=int(section_count),
+        liner1_top_m=float(liner1_top), liner1_shoe_m=float(liner1_shoe), liner1_id_in=float(liner1_id),
+        liner2_top_m=float(liner2_top), liner2_shoe_m=float(liner2_shoe), liner2_id_in=float(liner2_id),
         ff_casing=base_fc, ff_open_hole=base_fo,
         r600=r600, r300=r300, rpm=calc_rpm, wob_lbf=calc_wob,
         drilling_mode=calc_mode, max_iter=int(st.session_state.max_iter) if 'max_iter' in st.session_state else 200,
         tolerance=1e-7, relaxation=0.60,
     )
-    with st.spinner('Calculating nominal case and friction sensitivity envelope...'):
-        trajectory = minimum_curvature(survey)
-        result = run_case(survey, components, config, base_fc, base_fo, calc_bit_torque)
-        sensitivity = build_sensitivity(
-            survey, components, config,
-            ff_casing_min, ff_casing_max, ff_open_min, ff_open_max, calc_bit_torque
-        )
-        if analysis_string != 'Drilling':
-            torque_cols = ['SurfaceTorque_lbf_ft', 'BitTorque_lbf_ft', 'ContactTorque_lbf_ft', 'ViscousTorque_lbf_ft']
-            for col in torque_cols:
-                if col in result.columns:
-                    result[col] = 0.0
-            for sdf in sensitivity.values():
+    try:
+        with st.spinner('Calculating nominal case and friction sensitivity envelope...'):
+            trajectory = minimum_curvature(survey)
+            result = run_case(survey, components, config, base_fc, base_fo, calc_bit_torque)
+            sensitivity = build_sensitivity(
+                survey, components, config,
+                ff_casing_min, ff_casing_max, ff_open_min, ff_open_max, calc_bit_torque
+            )
+            if analysis_string != 'Drilling':
+                torque_cols = ['SurfaceTorque_lbf_ft', 'BitTorque_lbf_ft', 'ContactTorque_lbf_ft', 'ViscousTorque_lbf_ft']
                 for col in torque_cols:
-                    if col in sdf.columns:
-                        sdf[col] = 0.0
-    st.session_state.result = result
-    st.session_state.sensitivity = sensitivity
-    st.session_state.trajectory = trajectory
-    st.session_state.run_inputs = {
-        'analysis_string': analysis_string,
-        'td': td, 'kop': kop, 'eob': eob, 'final_inc': final_inc,
-        'casing_shoe': casing_shoe, 'casing_spec': casing_spec, 'casing_id': casing_id,
-        'open_hole_id': open_hole_id, 'dp_std': dp_std, 'hwdp_std': hwdp_std,
-        'hwdp_length': hwdp_length, 'dc_std': dc_std, 'dc_length': dc_length,
-        'dp_length': dp_length, 'casing_string_spec': casing_string_spec,
-        'casing_string_length': casing_string_length,
-        'mud_weight': mud_weight, 'r600': r600, 'r300': r300, 'mud_fill_percent': mud_fill_percent,
-        'ff_casing_min': ff_casing_min, 'ff_casing_max': ff_casing_max,
-        'ff_open_min': ff_open_min, 'ff_open_max': ff_open_max,
-        'ff_casing_nom': base_fc, 'ff_open_nom': base_fo,
-        'rpm': calc_rpm, 'wob': calc_wob, 'bit_torque': calc_bit_torque, 'drilling_mode': calc_mode,
-    }
+                    if col in result.columns:
+                        result[col] = 0.0
+                for sdf in sensitivity.values():
+                    for col in torque_cols:
+                        if col in sdf.columns:
+                            sdf[col] = 0.0
+        st.session_state.result = result
+        st.session_state.sensitivity = sensitivity
+        st.session_state.trajectory = trajectory
+        st.session_state.run_inputs = {
+            'analysis_string': analysis_string,
+            'td': td, 'kop': kop, 'eob': eob, 'final_inc': final_inc,
+            'casing_shoe': casing_shoe, 'casing_spec': casing_spec, 'casing_id': casing_id,
+            'section_count': section_count, 'liner1_top': liner1_top, 'liner1_shoe': liner1_shoe, 'liner1_spec': liner1_spec, 'liner1_id': liner1_id,
+            'liner2_top': liner2_top, 'liner2_shoe': liner2_shoe, 'liner2_spec': liner2_spec, 'liner2_id': liner2_id,
+            'open_hole_id': open_hole_id, 'dp_std': dp_std, 'hwdp_std': hwdp_std,
+            'hwdp_length': hwdp_length, 'dc_std': dc_std, 'dc_length': dc_length,
+            'dp_length': dp_length, 'casing_string_spec': casing_string_spec,
+            'casing_string_length': casing_string_length,
+            'mud_weight': mud_weight, 'r600': r600, 'r300': r300, 'mud_fill_percent': mud_fill_percent,
+            'ff_casing_min': ff_casing_min, 'ff_casing_max': ff_casing_max,
+            'ff_open_min': ff_open_min, 'ff_open_max': ff_open_max,
+            'ff_casing_nom': base_fc, 'ff_open_nom': base_fo,
+            'rpm': calc_rpm, 'wob': calc_wob, 'bit_torque': calc_bit_torque, 'drilling_mode': calc_mode,
+        }
+    except ValueError as exc:
+        st.error(f'Calculation stopped because the selected tubular/section geometry is incompatible: {exc}')
+        st.info('Check that every drillstring component and tool-joint OD is smaller than the active casing/liner ID or open-hole diameter at its position. For a 7-7/8 in open hole, the 8 in Drill Collar is not compatible; select a smaller DC.')
 
 # ============================================================
 # OUTPUT
@@ -482,23 +653,25 @@ if st.session_state.result is not None:
     sensitivity = st.session_state.sensitivity
     trajectory = st.session_state.trajectory
     ri = st.session_state.run_inputs
-    plot_top = min(float(result['MD_m'].max()), max(0.0, float(ri['casing_shoe']) - 100.0))
-    if plot_top >= float(result['MD_m'].max()):
-        plot_top = max(0.0, float(result['MD_m'].max()) - 100.0)
+    # Start both output plots and the detailed table 100 m above the shallower
+    # of KOP and previous casing shoe. Keep negative MD limits if the selected
+    # marker is shallower than 100 m, as requested for a consistent axis rule.
+    depth_reference = min(float(ri['kop']), float(ri['casing_shoe']))
+    plot_top = depth_reference - 100.0
 
     st.divider()
     st.header('Output')
 
     st.subheader('Hookload vs Measured Depth')
-    fig1 = plot_hookload(result, sensitivity, ri['td'], plot_top)
+    fig1 = plot_hookload(result, sensitivity, ri['td'], plot_top, ri)
     st.pyplot(fig1, use_container_width=True)
 
     st.subheader('Surface Torque vs Measured Depth')
-    fig2 = plot_torque(result, sensitivity, ri['td'], plot_top)
+    fig2 = plot_torque(result, sensitivity, ri['td'], plot_top, ri)
     st.pyplot(fig2, use_container_width=True)
 
     st.subheader('Detailed Hookload and Surface Torque Table')
-    detail = result[[
+    detail = result.loc[result['MD_m'] >= plot_top, [
         'MD_m', 'PUW_lbf', 'ROTW_lbf', 'SOW_lbf', 'SurfaceTorque_lbf_ft',
         'BitTorque_lbf_ft', 'ContactTorque_lbf_ft', 'ViscousTorque_lbf_ft',
         'DP_in_hole_m', 'HWDP_in_hole_m', 'DC_in_hole_m', 'Casing_in_hole_m', 'Liner_in_hole_m'
@@ -546,6 +719,7 @@ if st.session_state.result is not None:
                 sensitivity=sensitivity,
                 icon_path=ICON_PATH,
                 logo_path=RIGSIS_LOGO_PATH,
+                schematic_svg=schematic_svg,
             )
         st.success('Report generated.')
 
